@@ -1,0 +1,43 @@
+# Blueprint do Render para o backend do "Nosso Álbum de Amor".
+# Os valores com "sync: false" são segredos: o Render pede para você digitar no painel (nada fica neste arquivo).
+services:
+  - type: web
+    name: album-amor-api
+    runtime: python
+    plan: free
+    region: virginia            # mesma região do MongoDB Atlas (US_EAST_1)
+    rootDir: backend
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt --extra-index-url https://d33sy5i8bnduwe.cloudfront.net/simple/
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: DB_NAME
+        value: album_amor
+      - key: ALLOWED_ORIGINS
+        value: https://nosso-album-de-amor.netlify.app
+      - key: JWT_SECRET
+        generateValue: true
+      - key: MONGO_URL
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT_B64
+        sync: false
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_UPLOAD_PRESET
+        sync: false
+      - key: EMERGENT_LLM_KEY
+        sync: false
+      - key: OWNER_EMAIL
+        sync: false
+      - key: OWNER_NAME
+        sync: false
+      - key: OWNER_PASSWORD
+        sync: false
+      # Opcionais (e-mail de "esqueci minha senha" via Brevo; sem eles o app funciona, só não envia e-mail)
+      - key: BREVO_API_KEY
+        sync: false
+      - key: BREVO_SENDER_EMAIL
+        sync: false
