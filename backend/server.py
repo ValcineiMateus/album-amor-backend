@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 import json
@@ -15,14 +16,16 @@ from firebase_admin import credentials, firestore_async
 import jwt
 from bson import ObjectId
 from dotenv import load_dotenv
-from fastapi import APIRouter, Depends, FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 from starlette.middleware.cors import CORSMiddleware
 
-from emergentintegrations.llm.chat import LlmChat, StreamDone, TextDelta, UserMessage
+from llm import LLMError, LlmChat, StreamDone, TextDelta, UserMessage  # IA direta (Gemini/Groq/Claude/ChatGPT)
+import rum  # monitoramento de desempenho (usuários reais)
+from memcache import SingleFlightCache
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -32,7 +35,6 @@ db = client[os.environ["DB_NAME"]]
 JWT_SECRET = os.environ["JWT_SECRET"]
 CLOUD_NAME = os.environ["CLOUDINARY_CLOUD_NAME"]
 UPLOAD_PRESET = os.environ["CLOUDINARY_UPLOAD_PRESET"]
-LLM_KEY = os.environ["EMERGENT_LLM_KEY"]
 
 # E-mail (códigos de recuperação de senha) enviado pela API do Brevo, que usa a porta web comum (443)
 BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "")
@@ -53,6 +55,7 @@ MODELS = {
     "claude-sonnet": ("anthropic", "claude-sonnet-5-5"),
     "claude-opus": ("anthropic", "claude-opus-5-5"),
     "gpt": ("openai", "gpt-5.6-terra"),
+    "groq": ("groq", "llama-3.3-70b-versatile"),
 }
 
 # ---------------------------------------------------------------- models
@@ -418,9 +421,16 @@ async def upload(user: CurrentUser, file: UploadFile = File(...)):
     return {"url": r.json()["secure_url"]}
 
 
-async def list_memories() -> List[Memory]:
+memories_cache: SingleFlightCache = SingleFlightCache(ttl=30)  # 30s; invalidado em toda gravação feita por esta API
+
+
+async def _load_memories() -> List[Memory]:
     snaps = await groups.get()
     return sorted((memory_from_snap(s) for s in snaps), key=lambda m: (m.data, m.created_at), reverse=True)
+
+
+async def list_memories() -> List[Memory]:
+    return list(await memories_cache.get(_load_memories))
 
 
 @api.get("/photos", response_model=List[Memory])
@@ -453,6 +463,7 @@ async def create_photo(body: MemoryIn, user: CurrentUser):
                frameBg="#f7faf7", frameBorder="#dce8dc", frameTextColor="#2d1b1b")
     ref = groups.document()
     await ref.set(doc)
+    memories_cache.invalidate()
     m = await get_memory_or_404(ref.id)
     what = "um bilhete novo 💌" if m.is_free_note else "uma memória nova 💕"
     await notify_partner(user, "added", f"{user.name} adicionou {what}", m.id)
@@ -466,12 +477,14 @@ FIELD_LABELS = {"legenda": "a legenda", "data": "a data", "texto": "o texto", "i
 async def update_photo(pid: str, body: MemoryUpdate, user: CurrentUser):
     old = await get_memory_or_404(pid)
     changes = {k: v for k, v in body.model_dump(exclude_none=True).items() if getattr(old, k) != v}
-    if changes:
-        ts = now_iso()
-        await groups.document(pid).update({FS_FIELDS[k]: v for k, v in changes.items()} | {"updatedAt": ts, "updatedByName": user.name})
-        labels = [FIELD_LABELS[k] for k in FIELD_LABELS if k in changes]
-        what = labels[0] if len(labels) == 1 else ", ".join(labels[:-1]) + " e " + labels[-1]
-        await notify_partner(user, "edited", f"{user.name} alterou {what} de \"{memory_title(old)}\" ✏️", pid)
+    if not changes:
+        return old  # nada mudou: não grava nem lê de novo
+    ts = now_iso()
+    await groups.document(pid).update({FS_FIELDS[k]: v for k, v in changes.items()} | {"updatedAt": ts, "updatedByName": user.name})
+    memories_cache.invalidate()
+    labels = [FIELD_LABELS[k] for k in FIELD_LABELS if k in changes]
+    what = labels[0] if len(labels) == 1 else ", ".join(labels[:-1]) + " e " + labels[-1]
+    await notify_partner(user, "edited", f"{user.name} alterou {what} de \"{memory_title(old)}\" ✏️", pid)
     return await get_memory_or_404(pid)
 
 
@@ -479,6 +492,7 @@ async def update_photo(pid: str, body: MemoryUpdate, user: CurrentUser):
 async def delete_photo(pid: str, user: CurrentUser):
     old = await get_memory_or_404(pid)
     await groups.document(pid).delete()
+    memories_cache.invalidate()
     await notify_partner(user, "deleted", f"{user.name} removeu a memória \"{memory_title(old)}\"", None)
     return {"ok": True}
 
@@ -514,7 +528,7 @@ TONES = {
 
 def make_chat(model_key: str, system: str, session: str) -> LlmChat:
     provider, model = MODELS.get(model_key, MODELS["claude-sonnet"])
-    return LlmChat(api_key=LLM_KEY, session_id=session, system_message=system).with_model(provider, model)
+    return LlmChat(session_id=session, system_message=system).with_model(provider, model)
 
 
 def data_pt(d: date) -> str:
@@ -623,7 +637,11 @@ def chat_system(user_name: str, partner_name: str, context: str) -> str:
 
 
 def error_code(e: Exception) -> str:
+    if isinstance(e, LLMError):
+        return e.code
     msg = str(e).lower()
+    if "429" in msg or "rate limit" in msg:
+        return "limite_atingido"
     if any(k in msg for k in ("budget", "balance", "insufficient", "credit", "quota", "billing", "402")):
         return "sem_credito"
     return "indisponivel"
@@ -631,6 +649,7 @@ def error_code(e: Exception) -> str:
 
 def sse(gen):
     async def wrapped():
+        yield ": ok\n\n"  # abre o fluxo já (cabeçalhos saem na hora, antes de ler o álbum e chamar a IA); o app ignora comentários
         try:
             async for chunk in gen:
                 yield f"data: {json.dumps({'delta': chunk})}\n\n"
@@ -693,16 +712,20 @@ async def ai_clear(user: CurrentUser):
 
 @api.post("/ai/chat")
 async def ai_chat(body: ChatIn, user: CurrentUser):
-    history = await db.ai_messages.find({"user_id": user.id}).sort("created_at", -1).to_list(30)
-    history.reverse()
-    partner = (await user_out(user)).partner_name or "seu amor"
-    system = chat_system(user.name, partner, await album_context())
-    convo = "\n".join(f"{'Usuário' if m['role'] == 'user' else 'Assistente'}: {m['text']}" for m in history)
-    prompt = (f"Conversa anterior:\n{convo}\n\n" if convo else "") + f"Usuário ({user.name}): {body.text}"
-    chat = make_chat(body.model, system, f"chat-{user.id}")
     asked_at = now_iso()
 
     async def gen():
+        # histórico, parceiro e álbum são independentes: lidos ao mesmo tempo (antes, um depois do outro)
+        history, partner_out, context = await asyncio.gather(
+            db.ai_messages.find({"user_id": user.id}).sort("created_at", -1).to_list(30),
+            user_out(user),
+            album_context(),
+        )
+        history.reverse()
+        system = chat_system(user.name, partner_out.partner_name or "seu amor", context)
+        convo = "\n".join(f"{'Usuário' if m['role'] == 'user' else 'Assistente'}: {m['text']}" for m in history)
+        prompt = (f"Conversa anterior:\n{convo}\n\n" if convo else "") + f"Usuário ({user.name}): {body.text}"
+        chat = make_chat(body.model, system, f"chat-{user.id}")
         parts: list[str] = []
         async for c in stream_text(chat, prompt):
             parts.append(c)
@@ -718,19 +741,82 @@ async def ai_chat(body: ChatIn, user: CurrentUser):
 
 @api.post("/ai/letter")
 async def ai_letter(body: LetterIn, user: CurrentUser):
-    partner = (await user_out(user)).partner_name or "meu amor"
     tone = TONES.get(body.tone, TONES["romântica"])
     system = (
         "Você escreve cartas de amor em português do Brasil, em primeira pessoa, com voz humana e sincera. "
         f"O tom é {tone}. Evite clichês e exageros. Use apenas memórias reais do álbum que receber, "
         "citando momentos concretos (com a data ou a legenda). Nunca invente fatos."
     )
-    prompt = (
-        f"Escreva uma carta de {user.name} para {partner}, com 3 a 4 parágrafos curtos, usando 2 ou 3 memórias reais do álbum. "
-        f"Se houver algo em \"NESTE DIA\" ou aniversário próximo, vale citar. Termine com a assinatura de {user.name}.\n\n"
-        f"{await album_context()}"
-    )
-    return sse(stream_text(make_chat(body.model, system, f"letter-{secrets.token_hex(4)}"), prompt))
+
+    async def gen():
+        partner_out, context = await asyncio.gather(user_out(user), album_context())
+        partner = partner_out.partner_name or "meu amor"
+        prompt = (
+            f"Escreva uma carta de {user.name} para {partner}, com 3 a 4 parágrafos curtos, usando 2 ou 3 memórias reais do álbum. "
+            f"Se houver algo em \"NESTE DIA\" ou aniversário próximo, vale citar. Termine com a assinatura de {user.name}.\n\n"
+            f"{context}"
+        )
+        async for c in stream_text(make_chat(body.model, system, f"letter-{secrets.token_hex(4)}"), prompt):
+            yield c
+
+    return sse(gen())
+
+
+# ---------------------------------------------------------------- desempenho (RUM)
+RUM_KEY = os.environ.get("METRICS_KEY", "")  # sem ela, a página de resumo fica desligada
+RUM_RETENTION_DAYS = 30
+_rum_hits: dict[str, list[float]] = {}
+
+
+def _client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    return fwd or (request.client.host if request.client else "?")
+
+
+def _rum_rate_limited(ip: str, limit: int = 20, window: float = 60.0) -> bool:
+    now = datetime.now(timezone.utc).timestamp()
+    hits = [t for t in _rum_hits.get(ip, []) if now - t < window]
+    if len(hits) >= limit:
+        _rum_hits[ip] = hits
+        return True
+    hits.append(now)
+    _rum_hits[ip] = hits
+    if len(_rum_hits) > 2000:  # limpeza simples para a memória não crescer
+        for k in [k for k, v in _rum_hits.items() if not v or now - v[-1] > window]:
+            _rum_hits.pop(k, None)
+    return False
+
+
+@api.post("/metrics", status_code=204)
+async def metrics_ingest(request: Request):
+    """Recebe o relatório do app (enviado em segundo plano). Nunca devolve erro ao navegador."""
+    try:
+        origin = request.headers.get("origin")
+        if "*" not in ALLOWED_ORIGINS and origin and origin not in ALLOWED_ORIGINS:
+            return Response(status_code=204)
+        if int(request.headers.get("content-length") or 0) > rum.MAX_BODY or _rum_rate_limited(_client_ip(request)):
+            return Response(status_code=204)
+        doc = rum.parse_payload(await request.body())
+        if doc:
+            doc["created_at"] = datetime.now(timezone.utc)
+            await db.rum.insert_one(doc)
+    except Exception:
+        logger.exception("RUM: falha ao registrar relatório")
+    return Response(status_code=204)
+
+
+@api.get("/metrics/summary")
+async def metrics_summary(key: str = "", days: int = 7, format: str = "html"):
+    """Resumo para o dono: /api/metrics/summary?key=SUA_METRICS_KEY&days=7 (&format=json)."""
+    if not RUM_KEY or not secrets.compare_digest(key.encode(), RUM_KEY.encode()):
+        raise HTTPException(404, "Not Found")  # não revela que a página existe
+    days = max(1, min(days, RUM_RETENTION_DAYS))
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    docs = await db.rum.find({"created_at": {"$gte": since}}).sort("created_at", -1).to_list(5000)
+    summary = rum.summarize(docs)
+    if format == "json":
+        return JSONResponse(summary, headers={"Cache-Control": "no-store"})
+    return HTMLResponse(rum.render_html(summary, days), headers={"Cache-Control": "no-store"})
 
 
 @api.get("/")
@@ -749,6 +835,7 @@ app.add_middleware(CORSMiddleware, allow_credentials=True, allow_origins=ALLOWED
 @app.on_event("startup")
 async def startup():
     await db.users.create_index("email", unique=True)
+    await db.rum.create_index("created_at", expireAfterSeconds=RUM_RETENTION_DAYS * 86400)  # apaga relatórios antigos sozinho
     # limpa registros antigos de tentativas de login/recuperação
     old = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
     await db.attempts.delete_many({"at": {"$lt": old}})
