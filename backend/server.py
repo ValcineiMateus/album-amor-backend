@@ -55,7 +55,7 @@ MODELS = {
     "claude-sonnet": ("anthropic", "claude-sonnet-5-5"),
     "claude-opus": ("anthropic", "claude-opus-5-5"),
     "gpt": ("openai", "gpt-5.6-terra"),
-    "groq": ("groq", "llama-3.3-70b-versatile"),
+    "groq": ("groq", "openai/gpt-oss-120b"),
 }
 
 # ---------------------------------------------------------------- models
