@@ -30,7 +30,7 @@ ANTHROPIC_BASE = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com
 OPENAI_BASE = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com")
 DEFAULT_MODELS = {
     "gemini": os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite"),
-    "groq": os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"),
+    "groq": os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b"),
     "anthropic": "claude-sonnet-5-5",
     "openai": "gpt-5.6-terra",
 }
