@@ -34,7 +34,7 @@ DEFAULT_MODELS = {
     "anthropic": "claude-sonnet-5-5",
     "openai": "gpt-5.6-terra",
 }
-FALLBACK_ORDER = ("gemini", "groq", "anthropic", "openai")
+FALLBACK_ORDER = ("groq", "gemini", "anthropic", "openai")
 MAX_TOKENS = 1500
 
 
