@@ -25,7 +25,7 @@ import httpx
 logger = logging.getLogger("album.llm")
 
 GEMINI_BASE = os.environ.get("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com")
-GROQ_BASE = os.environ.get("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+GROQ_BASE = os.environ.get("GROQ_BASE_URL", "https://api.groq.com/openai")
 ANTHROPIC_BASE = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
 OPENAI_BASE = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com")
 DEFAULT_MODELS = {
